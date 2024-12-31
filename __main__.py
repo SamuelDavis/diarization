@@ -1,15 +1,11 @@
 import sys
 from os.path import exists
-from pprint import pprint
-from typing import Generator
 
 import torch
-from numpy import bool_
 from pyannote.audio import Pipeline
 from pyannote.core.annotation import Annotation
 from pyannote.core.segment import Segment
 from pydub import AudioSegment
-from pydub.audio_segment import AudioSegment as Foobar
 from whisper import load_model
 
 from utils import get_chunks, read_lines
@@ -30,8 +26,6 @@ model = load_model("medium")
 audio = AudioSegment.from_file(filename)
 assert isinstance(audio, AudioSegment)
 audio.export("_tmp/full.mp3", format="mp3")
-
-print("\n\n")
 
 for [start, end] in chunks:
     slice = audio[start:end]
@@ -66,4 +60,4 @@ for [start, end] in chunks:
         text = segment.get("text")
         assert isinstance(text, str)
         print(f'{start}, {end}: "{text}"')
-exit(0)
+

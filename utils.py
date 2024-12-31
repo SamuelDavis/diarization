@@ -1,6 +1,5 @@
 import re
 import subprocess
-from pprint import pprint
 
 
 def read_lines(filename: str) -> list[float]:
@@ -21,12 +20,24 @@ def read_lines(filename: str) -> list[float]:
         awk_cmd, capture_output=True, input=ffmpeg_result.stderr
     )
 
-    match = re.compile("silence_(?:start|end): ([\\d.]+)")
+    regex = re.compile("silence_(?:start|end): ([\\d.]+)")
     lines = awk_result.stdout.splitlines()
     lines = map(lambda line: line.decode(), lines)
-    lines = map(lambda line: match.findall(line), lines)
+    lines = map(lambda line: regex.findall(line), lines)
     lines = filter(lambda line: len(line) > 0, lines)
-    lines = map(lambda line: float(line[0]) * 1000, lines)
+    lines = map(lambda line: float(line[0]), lines)
+    lines = list(lines)
+
+    if lines:
+        regex = re.compile("Duration: (\\d+):(\\d+):([\\d\\.]+)")
+        result = regex.findall(ffmpeg_result.stderr.decode())
+        if result:
+            [result] = result
+            (hrs, mins, secs) = tuple(map(float, result))
+            total = secs + mins * 60 + hrs * 60 * 60
+            lines = [total]
+
+    lines = map(lambda line: line * 1000, lines)
 
     return list(lines)
 
@@ -35,11 +46,14 @@ def get_chunks(lines: list[float], size=30) -> list[list[float]]:
     start = 0
     chunks: list[list[float]] = []
 
-    for i in range(1, len(lines), 2):
-        end = lines[i]
+    for end in lines:
         delta = end - start
         if delta > size:
             chunks.append([start, end])
             start = end
+
+    end = lines[-1]
+    if end > start:
+        chunks.append([start, end])
 
     return chunks
