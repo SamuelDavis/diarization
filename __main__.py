@@ -1,4 +1,5 @@
 import sys
+from os import environ
 from os.path import exists
 
 import torch
@@ -10,6 +11,8 @@ from whisper import load_model
 
 from utils import get_chunks, read_lines
 
+token = environ.get("HUGGING_FACE_AUTH_TOKEN")
+assert token
 assert torch.cuda.is_available()
 assert len(sys.argv) >= 2
 
@@ -19,8 +22,9 @@ chunks = get_chunks(lines)
 
 pipeline = Pipeline.from_pretrained(
     "pyannote/speaker-diarization-3.1",
-    use_auth_token="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",
+    use_auth_token=token,
 ).to(torch.device("cuda"))
+
 
 model = load_model("medium")
 audio = AudioSegment.from_file(filename)
@@ -60,4 +64,3 @@ for [start, end] in chunks:
         text = segment.get("text")
         assert isinstance(text, str)
         print(f'{start}, {end}: "{text}"')
-
