@@ -44,7 +44,7 @@ for [start, end] in chunks:
 
     transcription = model.transcribe(file)
     assert isinstance(transcription, dict)
-    diarization = pipeline(file)
+    diarization = pipeline(file, num_speakers=2)
     assert isinstance(diarization, Annotation)
 
     for tuple in diarization.itertracks(yield_label=True):
