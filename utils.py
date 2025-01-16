@@ -1,6 +1,9 @@
 import re
 import subprocess
 
+from pyannote.core.annotation import Annotation
+from pyannote.core.segment import Segment
+
 
 def read_lines(filename: str) -> list[float]:
     ffmpeg_cmd = [
@@ -57,3 +60,23 @@ def get_chunks(lines: list[float], size=30) -> list[list[float]]:
         chunks.append([start, end])
 
     return chunks
+
+
+def print_results(transcription: dict, diarization: Annotation) -> None:
+    for tuple in diarization.itertracks(yield_label=True):
+        (segment, _, speaker) = (tuple + (None, None, None))[:3]
+        assert isinstance(segment, Segment)
+        assert isinstance(speaker, str)
+        print(f"{segment.start}, {segment.end}: speaker {speaker}")
+
+    segments = transcription.get("segments")
+    assert isinstance(segments, list)
+    for segment in segments:
+        assert isinstance(segment, dict)
+        start = segment.get("start")
+        assert isinstance(start, float)
+        end = segment.get("end")
+        assert isinstance(end, float)
+        text = segment.get("text")
+        assert isinstance(text, str)
+        print(f'{start}, {end}: "{text}"')
