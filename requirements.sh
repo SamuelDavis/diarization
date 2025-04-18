@@ -16,5 +16,8 @@ pip3 install \
   --index-url https://download.pytorch.org/whl/nightly/cu128 \
   --pre torch torchaudio 
 
-pip3 install whisper pyannote.audio demucs
+pip3 install \
+  git+https://github.com/openai/whisper.git \
+  pyannote.audio \
+  demucs
 
