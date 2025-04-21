@@ -4,7 +4,7 @@ from json import dumps
 from pathlib import Path
 
 import torch
-from pyannote.audio import Pipeline
+from pyannote.audio import Inference, Model, Pipeline
 from pyannote.core.annotation import Annotation
 from pyannote.core.segment import Segment
 from whisper import load_model
@@ -78,7 +78,6 @@ def preprocess(input: Path, output: Path) -> Path:
 
 def transcribe(input: Path) -> dict:
     output = input.with_suffix(".json")
-
     model = load_model("large")
     transcription = model.transcribe(str(input), fp16=True)
     assert isinstance(transcription, dict)
@@ -90,11 +89,31 @@ def transcribe(input: Path) -> dict:
 
 
 def annotate(input: Path, token: str) -> Annotation:
+    model = Model.from_pretrained("pyannote/embedding", use_auth_token=token)
+    inference = Inference(model, window="whole")
+
+    s1_filepath = Path("./enrollment/s1.wav").resolve()
+    assert s1_filepath.is_file()
+    s1_embedding = inference(s1_filepath)
+    s2_filepath = Path("./enrollment/s2.wav").resolve()
+    assert s2_filepath.is_file()
+    s2_embedding = inference(s2_filepath)
+
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
         use_auth_token=token,
     ).to(torch.device("cuda"))
-    annotation = pipeline(input, num_speakers=2)
+    annotation = pipeline(
+        {
+            "audio": input,
+            "num_speakers": 2,
+            "enrollment": {
+                "Speaker 1": s1_embedding,
+                "Speaker 2": s2_embedding,
+            },
+        }
+    )
+
     assert isinstance(annotation, Annotation)
 
     with open(input.with_suffix(".rttm"), "w") as f:
