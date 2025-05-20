@@ -13,5 +13,5 @@ assert token
 input, output = parse_args(argv)
 input = preprocess(input, output)
 transcription = transcribe(input)
-annotation = annotate(input, token)
+annotation = annotate(token, input)
 alignment = align(input, transcription, annotation)

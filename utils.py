@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from pyannote.audio import Pipeline
 from pyannote.core import Segment
-from pyannote.core.annotation import Annotation
+from pyannote.core.annotation import Annotation, Label
 from pyannote.core.segment import Segment
 from whisper import load_model
 
@@ -61,13 +61,15 @@ def preprocess(input: Path, output: Path) -> Path:
     cmd = " ".join(
         [
             "ffmpeg",
+            "-y",
             f"-i {tmp}",
             f"-ss {buffer}",
             f"-t {seconds}",
             "-ar 16000",
             "-ac 1",
             "-af loudnorm=I=-16:TP=-1.5:LRA=11,silenceremove=1:0:-45dB",
-            "-rf64 auto",
+            "-rf64",
+            "auto",
             str(output),
         ]
     )
@@ -89,18 +91,13 @@ def transcribe(input: Path) -> dict:
     return transcription
 
 
-def annotate(input: Path, token: str) -> Annotation:
+def annotate(token: str, input: Path) -> Annotation:
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1",
         use_auth_token=token,
     ).to(torch.device("cuda"))
 
-    annotation = pipeline(
-        {
-            "audio": input,
-            "num_speakers": 2,
-        }
-    )
+    annotation = pipeline({"audio": input, "num_speakers": 2})
 
     assert isinstance(annotation, Annotation)
 
@@ -114,6 +111,11 @@ def align(
     input: Path, transcription: dict, annotation: Annotation
 ) -> list[list[float | str]]:
     result = []
+    _speaker: str = ""
+    _start: float = 0.0
+    _end: float = 0.0
+    _text: list[str] = []
+
     for segment in transcription["segments"]:
         assert isinstance(segment, dict)
         start, end, text = segment["start"], segment["end"], segment["text"]
@@ -121,7 +123,22 @@ def align(
         assert isinstance(end, float)
         assert isinstance(text, str)
         speaker = annotation.crop(Segment(start, end)).argmax()
-        result.append([start, end, f"Speaker {speaker}", text])
+        assert isinstance(speaker, Label)
+        speaker = str(speaker)
+
+        if not _speaker:
+            _speaker = speaker
+            _start = start
+            _text = []
+
+        if speaker is _speaker:
+            _text.append(text.strip())
+        else:
+            result.append([_start, _end, _speaker, " ".join(_text).strip()])
+            _speaker = speaker
+            _start = start
+            _text = [text]
+        _end = end
 
     with open(input.with_suffix(".csv"), "w") as f:
         writer = csv.writer(f)
