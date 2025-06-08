@@ -3,8 +3,10 @@ import subprocess
 from json import dumps
 from pathlib import Path
 
+import numpy
 import torch
-from pyannote.audio import Pipeline
+from numpy import ndarray
+from pyannote.audio import Audio, Model, Pipeline
 from pyannote.core import Segment
 from pyannote.core.annotation import Annotation, Label
 from pyannote.core.segment import Segment
@@ -93,12 +95,10 @@ def transcribe(input: Path) -> dict:
 
 def annotate(token: str, input: Path) -> Annotation:
     pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        use_auth_token=token,
+        "pyannote/speaker-diarization-3.1", use_auth_token=token
     ).to(torch.device("cuda"))
 
-    annotation = pipeline({"audio": input, "num_speakers": 2})
-
+    annotation = pipeline({"audio": input})
     assert isinstance(annotation, Annotation)
 
     with open(input.with_suffix(".rttm"), "w") as f:
@@ -145,3 +145,15 @@ def align(
         writer.writerows(result)
 
     return result
+
+
+def enroll(
+    speaker00: list[Path], speaker01: list[Path]
+) -> dict[str, dict[str, list[ndarray]]]:
+    speaker00_arr: list[ndarray] = list(map(numpy.load, speaker00))
+    speaker01_arr: list[ndarray] = list(map(numpy.load, speaker01))
+
+    return {
+        "SPEAKER_00": {"embeddings": speaker00_arr},
+        "SPEAKER_01": {"embeddings": speaker01_arr},
+    }
