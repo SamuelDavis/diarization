@@ -1,17 +1,26 @@
+import argparse
 import csv
 import json
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from os import environ
 from pathlib import Path
-from sys import argv
 from uuid import uuid4
 
 import torch
 from pyannote.audio import Pipeline
 from pyannote.core import Annotation, Segment
 from whisper import load_model
+
+
+@dataclass
+class Args:
+    input: Path
+    output: Path
+    speakers: int
+    token: str
 
 
 @dataclass
@@ -28,16 +37,46 @@ def cmd_exists(cmd: str) -> None:
     )
 
 
-def parse_args(args: list[str]) -> list[Path]:
-    assert len(args) == 3
-    _, input, output = args
+def validate_input(value: str) -> Path:
+    path = Path(value)
+    assert path.exists(), f"{path} does not exist"
+    assert path.suffix == ".mp3", f"{path} is not an .mp3"
+    return path
 
-    input = Path(input).resolve()
-    assert input.is_file()
 
-    output = Path(output).resolve()
+def validate_output(value: str) -> Path:
+    path = Path(value)
+    for suffix in ".csv", ".rttm", ".wav":
+        filepath = path.with_suffix(suffix)
+        assert not filepath.exists(), f"{filepath} already exists"
+    return path
 
-    return [input, output]
+
+def parse_args() -> Args:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input", type=validate_input, help="the .mp3 file to be parsed")
+    parser.add_argument(
+        "output",
+        type=validate_output,
+        help="where to place the parsed .csv, .rttm, and .wav files",
+    )
+    parser.add_argument(
+        "--token",
+        type=str,
+        default=environ.get("HUGGING_FACE_AUTH_TOKEN"),
+        help="hugging face auth token",
+    )
+    parser.add_argument(
+        "--speakers",
+        type=int,
+        default=2,
+        help="The number of speakers expected in the parsed audio file.",
+    )
+
+    args = parser.parse_args()
+    return Args(
+        input=args.input, output=args.output, speakers=args.speakers, token=args.token
+    )
 
 
 def convert(input: Path) -> Path:
@@ -110,12 +149,12 @@ def transcribe(input: Path) -> list[dict]:
     return words
 
 
-def annotate(token: str, input: Path) -> Annotation:
+def annotate(token: str, speakers: int, input: Path) -> Annotation:
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1", use_auth_token=token
     ).to(torch.device("cuda"))
 
-    annotation = pipeline(input, num_speakers=2)
+    annotation = pipeline(input, num_speakers=speakers)
     assert isinstance(annotation, Annotation)
 
     return annotation
@@ -161,23 +200,26 @@ def align(transcription: list[dict], annotation: Annotation) -> list[Transcript]
 
 if __name__ == "__main__":
     assert torch.cuda.is_available()
-    assert torch.version.cuda == "12.8"
+    assert torch.version.cuda == "12.8"  # type: ignore
     token = environ.get("HUGGING_FACE_AUTH_TOKEN")
     assert token
 
     cmd_exists("ffmpeg")
     cmd_exists("demucs")
 
-    input, output = parse_args(argv)
-    converted = convert(input)
+    args = parse_args()
+    converted = convert(args.input)
     denoised = denoise(converted)
     normalized = normalize(denoised)
+    annotation = annotate(args.token, args.speakers, normalized)
     transcription = transcribe(normalized)
-    annotation = annotate(token, normalized)
     alignment = align(transcription, annotation)
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with open(output, "w") as f:
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(normalized, args.output.with_suffix(".wav"))
+    with open(args.output.with_suffix(".rttm"), "w") as f:
+        annotation.write_rttm(f)
+    with open(args.output.with_suffix(".csv"), "w") as f:
         writer = csv.writer(f)
         for t in alignment:
             row = [t.start, t.end, t.speaker, t.text]
