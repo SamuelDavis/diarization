@@ -1,226 +1,174 @@
-import argparse
-import csv
-import json
-import re
+import hashlib
+import os
 import shutil
 import subprocess
+import sys
+from argparse import ArgumentParser
 from dataclasses import dataclass
-from os import environ
 from pathlib import Path
+from pprint import pprint
+from typing import Callable, List
 from uuid import uuid4
 
-import torch
-from pyannote.audio import Pipeline
-from pyannote.core import Annotation, Segment
-from whisper import load_model
+import numpy
+import soundfile
+import webrtcvad
+
+# ===============================
+# Tunables
+# ===============================
+
+# --- Preprocess (ffmpeg) ---
+# Telephony speech is concentrated ≈ 300–3400 Hz. We use a slightly broader phone-band:
+# - highpass 120 Hz: removes rumble/handling noise below fundamental; keeps male fundamentals (>~85 Hz) thanks to harmonics.
+# - lowpass 3800 Hz: cuts hiss; keeps key consonant energy ~>2 kHz while respecting phone bandwidth.
+# Denoise strength nr=12 (on 0–100-ish scale for afftdn): mild noise reduction that usually preserves fricatives.
+FFMPEG_AF = "loudnorm=I=-16:TP=-1.5:LRA=11,highpass=f=120,lowpass=f=3800,afftdn=nr=12"
+
+# --- Speaker embedding windows ---
+# Short windows help capture quick timbre cues during fast exchanges.
+EMB_WINDOW_S = 1.5  # 1.5 s windows: long enough for stable ECAPA embedding; short for frequent turns.
+EMB_HOP_S = 0.75  # 50% overlap improves robustness without exploding compute.
+
+# --- Clustering ---
+
+# --- ASR ---
+# accurate for English telephony; change with --asr-model if VRAM tight.
+ASR_MODEL = "large-v3"
+# modest beam for good quality without big latency.
+ASR_BEAM = 5
+# or "int8_float16" to reduce VRAM with small WER hit.
+ASR_COMPUTE_TYPE = "float16"
+# lets Faster-Whisper downweight non-speech internally for stability.
+ASR_VAD_FILTER = True
+
+# --- Profiles (optional) ---
+# Persist speaker prototypes to keep "A/B" stable across calls:
+# set via --profiles path to enable (e.g., profiles.json)
+PROFILE_DB = None
+# EMA factor when updating centroids: new = (1-a)*old + a*new (a=0.3 reacts but stays stable).
+PROFILE_SMOOTH = 0.3
+
+# --- Constants ---
+MAX_16BIT_INT_VAL = 32767.0
+INPUT_SAMPLE_RATE_KHZ = 16000
 
 
+# ===============================
+# Data structures
+# ===============================
 @dataclass
 class Args:
     input: Path
     output: Path
-    speakers: int
-    token: str
+    profiles: None | Path
+    # Minimum speech segment length (ms) to keep tiny back-channels (~ “oh”, “ok”) without keeping clicks.
+    min_voice: int
+    # Minimum non-speech gap (ms) to terminate a segment (short to preserve rapid turn-taking).
+    min_silence: int
+    # Aggressiveness 0..3: higher = more speech rejections. 2 balances false accepts/rejects on phone noise.
+    vad_aggression: int
+    # WebRTC VAD accepts 10/20/30 ms frames. 30 ms gives steadier decisions in noise.
+    frame_ms: int
+    # Spectral clustering on cosine affinities is robust to blob shapes and common in diarization literature.
+    num_speakers: int
 
 
 @dataclass
-class Transcript:
+class VADSegment:
     start: float
     end: float
-    text: str
-    speaker: str
+    voiced: bool
 
 
-def cmd_exists(cmd: str) -> None:
-    subprocess.run(
-        f"command -v {cmd}", shell=True, stdout=subprocess.DEVNULL, check=True
-    )
-
-
-def validate_input(value: str) -> Path:
-    path = Path(value)
-    assert path.exists(), f"{path} does not exist"
-    assert path.suffix == ".mp3", f"{path} is not an .mp3"
-    return path
-
-
-def validate_output(value: str) -> Path:
-    path = Path(value)
-    for suffix in ".csv", ".rttm", ".wav":
-        filepath = path.with_suffix(suffix)
-        assert not filepath.exists(), f"{filepath} already exists"
-    return path
+# ===============================
+# Main
+# ===============================
 
 
 def parse_args() -> Args:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input", type=validate_input, help="the .mp3 file to be parsed")
-    parser.add_argument(
-        "output",
-        type=validate_output,
-        help="where to place the parsed .csv, .rttm, and .wav files",
-    )
-    parser.add_argument(
-        "--token",
-        type=str,
-        default=environ.get("HUGGING_FACE_AUTH_TOKEN"),
-        help="hugging face auth token",
-    )
-    parser.add_argument(
-        "--speakers",
-        type=int,
-        default=2,
-        help="The number of speakers expected in the parsed audio file.",
-    )
+    parser = ArgumentParser(description="Transcribe and diarize audio files.")
+    parser.add_argument("input", help="audio filepath", type=Path)
+    parser.add_argument("--output", default=os.getcwd(), type=Path)
+    parser.add_argument("--profiles", default=None, help="speaker profiles.json path")
+    parser.add_argument("--min_voice", default=120, type=int, help="min voice ms")
+    parser.add_argument("--min_silence", default=120, type=int, help="min silence ms")
+    parser.add_argument("--vad_aggression", default=2, type=int, help="0..3")
+    parser.add_argument("--frame_ms", default=30, type=int, help="10/20/30 ms")
+    parser.add_argument("--num_speakers", default=2, type=int)
 
-    args = parser.parse_args()
-    return Args(
-        input=args.input, output=args.output, speakers=args.speakers, token=args.token
-    )
+    parsed = parser.parse_args()
+    args = Args(**vars(parsed))
+    assert args.input.is_file()
+    assert args.output.is_dir()
+    assert args.vad_aggression > 0 and args.vad_aggression <= 3
+    assert args.frame_ms == 10 or args.frame_ms == 20 or args.frame_ms == 30
+
+    return args
 
 
-def convert(input: Path) -> Path:
-    output = Path(f"/tmp/{uuid4()}.wav")
-    cmd = f"""
-ffmpeg -y -i '{input}' \
-    -acodec pcm_s16le \
+def preprocess_audio(input: Path) -> Path:
+    if not shutil.which("ffmpeg"):
+        sys.exit("ffmpeg not found in PATH. Install ffmpeg (sudo apt install ffmpeg).")
+
+    digest = hashlib.sha1(str(input).encode()).hexdigest()
+    output = Path(f"/tmp/{digest}.wav")
+
+    if not output.exists():
+        cmd = f"""
+ffmpeg -y \
+    -i "{input}" \
     -ac 1 \
-    -ar 48000 \
-    {output}
+    -ar {INPUT_SAMPLE_RATE_KHZ} \
+    -af "{FFMPEG_AF}" \
+    "{output}"
 """
-    subprocess.run(cmd, shell=True, check=True)
-    return output
-
-
-def denoise(input: Path) -> Path:
-    output = Path(f"/tmp/{uuid4()}/htdemucs")
-    cmd = f"""
-demucs '{input.as_posix()}' \
-    --two-stems vocals \
-    --name '{output.name}' \
-    --out '{output.parent}' \
-    --filename '{{stem}}.{{ext}}'
-"""
-    subprocess.run(cmd, shell=True, check=True)
-    return Path(f"{output}/vocals.wav")
-
-
-def normalize(input: Path) -> Path:
-    output = Path(f"/tmp/{uuid4()}.wav")
-    cmd = f"""
-ffmpeg -i '{input}' -af loudnorm=print_format=json -f null -
-"""
-    result = subprocess.run(
-        cmd, shell=True, stderr=subprocess.PIPE, text=True, check=True
-    )
-
-    match = re.search(r"\{[\s\S]*?\}", result.stderr)
-    assert match
-    measurements = json.loads(match.group(0))
-
-    apply_filter = (
-        f"loudnorm=I=-16:TP=-1.5:LRA=11"
-        f":measured_I={measurements['input_i']}"
-        f":measured_TP={measurements['input_tp']}"
-        f":measured_LRA={measurements['input_lra']}"
-        f":measured_thresh={measurements['input_thresh']}"
-        f":offset={measurements['target_offset']}"
-        f":linear=true:print_format=summary"
-    )
-    cmd = f"""
-ffmpeg -y -i '{input}' -af {apply_filter} {output}
-"""
-    subprocess.run(cmd, shell=True, check=True)
+        subprocess.run(cmd, shell=True, check=True)
 
     return output
 
 
-def transcribe(input: Path) -> list[dict]:
-    transcription = load_model("large").transcribe(str(input), word_timestamps=True)
-    segments = transcription["segments"]
-    assert isinstance(segments, list)
+def voice_activation_detection(input: Path, args: Args) -> List[VADSegment]:
+    audio, sample_rate = soundfile.read(input)
+    assert sample_rate == INPUT_SAMPLE_RATE_KHZ
+    if audio.ndim > 1:
+        audio = audio[:, 0]  # ensure mono
+    audio = numpy.ascontiguousarray(audio)
+    pcm16 = (numpy.clip(audio, -1.0, 1.0) * MAX_16BIT_INT_VAL).astype(numpy.int16)
+    frame_length = int(sample_rate * args.frame_ms / 1000)
+    max_length = len(pcm16) // frame_length
+    segments: List[VADSegment] = []
 
-    words: list[dict] = []
-    for segment in segments:
-        assert isinstance(segment, dict)
-        for word in segment["words"]:
-            assert isinstance(word, dict)
-            words.append(word)
-    return words
+    to_ms: Callable[[float], float] = lambda n: n / frame_length * args.frame_ms
 
+    vad = webrtcvad.Vad(args.vad_aggression)
+    segment_start = 0
+    segment_stop = 0
+    segment_voice = False
+    for i in range(0, max_length):
+        start = i * frame_length
+        stop = start + frame_length
+        frame = pcm16[start:stop]
+        voiced: bool = vad.is_speech(frame.tobytes(), sample_rate)
 
-def annotate(token: str, speakers: int, input: Path) -> Annotation:
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1", use_auth_token=token
-    ).to(torch.device("cuda"))
-
-    annotation = pipeline(input, num_speakers=speakers)
-    assert isinstance(annotation, Annotation)
-
-    return annotation
-
-
-def align(transcription: list[dict], annotation: Annotation) -> list[Transcript]:
-    alignment: list[Transcript] = []
-
-    _start: float = 0.0
-    _end: float = 0.0
-    _text: str = ""
-    _speaker: str = ""
-
-    for word in transcription:
-        start, end, word = word["start"], word["end"], word["word"]
-        assert isinstance(start, float)
-        assert isinstance(end, float)
-        assert isinstance(word, str)
-        segment = Segment(start, end)
-        speaker = str(annotation.crop(segment).argmax() or _speaker)
-
-        if speaker == _speaker:
-            _text = _text + word
-            _end = end
-        else:
-            if _speaker:
-                alignment.append(
-                    Transcript(start=_start, end=_end, text=_text, speaker=_speaker)
+        if segment_voice != voiced:
+            segments.append(
+                VADSegment(
+                    to_ms(segment_start),
+                    to_ms(segment_stop),
+                    segment_voice,
                 )
+            )
+            segment_voice = voiced
+            segment_start = start
 
-            _speaker = speaker
-            _text = word
-            _start = start
-            _end = end
+        segment_stop = stop
 
-    if _speaker:
-        alignment.append(
-            Transcript(start=_start, end=_end, text=_text, speaker=_speaker)
-        )
-
-    return alignment
+    return segments
 
 
 if __name__ == "__main__":
-    assert torch.cuda.is_available()
-    assert torch.version.cuda == "12.8"  # type: ignore
-    token = environ.get("HUGGING_FACE_AUTH_TOKEN")
-    assert token
-
-    cmd_exists("ffmpeg")
-    cmd_exists("demucs")
-
     args = parse_args()
-    converted = convert(args.input)
-    denoised = denoise(converted)
-    normalized = normalize(denoised)
-    annotation = annotate(args.token, args.speakers, normalized)
-    transcription = transcribe(normalized)
-    alignment = align(transcription, annotation)
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(normalized, args.output.with_suffix(".wav"))
-    with open(args.output.with_suffix(".rttm"), "w") as f:
-        annotation.write_rttm(f)
-    with open(args.output.with_suffix(".csv"), "w") as f:
-        writer = csv.writer(f)
-        for t in alignment:
-            row = [t.start, t.end, t.speaker, t.text]
-            writer.writerow(row)
+    wav = preprocess_audio(args.input)
+    vad = voice_activation_detection(wav, args)
+    pprint(vad)

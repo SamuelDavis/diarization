@@ -21,3 +21,4 @@ pip3 install \
   pyannote.audio \
   demucs
 
+pip3 install faster-whisper webrtcvad soundfile pydub numpy scipy scikit-learn tqdm speechbrain
