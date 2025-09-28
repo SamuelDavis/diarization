@@ -8,11 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from pprint import pprint
 from typing import Callable, List
-from uuid import uuid4
 
 import numpy
 import soundfile
+import torch
 import webrtcvad
+from speechbrain.inference import EncoderClassifier
 
 # ===============================
 # Tunables
@@ -26,9 +27,6 @@ import webrtcvad
 FFMPEG_AF = "loudnorm=I=-16:TP=-1.5:LRA=11,highpass=f=120,lowpass=f=3800,afftdn=nr=12"
 
 # --- Speaker embedding windows ---
-# Short windows help capture quick timbre cues during fast exchanges.
-EMB_WINDOW_S = 1.5  # 1.5 s windows: long enough for stable ECAPA embedding; short for frequent turns.
-EMB_HOP_S = 0.75  # 50% overlap improves robustness without exploding compute.
 
 # --- Clustering ---
 
@@ -72,6 +70,12 @@ class Args:
     frame_ms: int
     # Spectral clustering on cosine affinities is robust to blob shapes and common in diarization literature.
     num_speakers: int
+    # 1.5 s windows: long enough for stable ECAPA embedding; short for frequent turns.
+    emb_window_s: float
+    # 50% overlap improves robustness without exploding compute.
+    emb_hop_s: float
+    # empirically needed for ECAPA stability
+    ecapa_stability_floor: float
 
 
 @dataclass
@@ -79,6 +83,15 @@ class VADSegment:
     start: float
     end: float
     voiced: bool
+
+
+# ===============================
+# Utilities
+# ===============================
+def frange(start=0.0, end=0.0, jump=1.0):
+    while start < end:
+        yield start
+        start += jump
 
 
 # ===============================
@@ -96,6 +109,9 @@ def parse_args() -> Args:
     parser.add_argument("--vad_aggression", default=2, type=int, help="0..3")
     parser.add_argument("--frame_ms", default=30, type=int, help="10/20/30 ms")
     parser.add_argument("--num_speakers", default=2, type=int)
+    parser.add_argument("--emb_window_s", default=1.5, type=float)
+    parser.add_argument("--emb_hop_s", default=0.75, type=float)
+    parser.add_argument("--ecapa_stability_floor", default=0.6, type=float)
 
     parsed = parser.parse_args()
     args = Args(**vars(parsed))
@@ -128,9 +144,9 @@ ffmpeg -y \
     return output
 
 
-def voice_activation_detection(input: Path, args: Args) -> List[VADSegment]:
-    audio, sample_rate = soundfile.read(input)
-    assert sample_rate == INPUT_SAMPLE_RATE_KHZ
+def voice_activation_detection(
+    audio: numpy.typing.NDArray, sample_rate: int, args: Args
+) -> List[VADSegment]:
     if audio.ndim > 1:
         audio = audio[:, 0]  # ensure mono
     audio = numpy.ascontiguousarray(audio)
@@ -167,8 +183,55 @@ def voice_activation_detection(input: Path, args: Args) -> List[VADSegment]:
     return segments
 
 
+def embed_windows(
+    audio: numpy.typing.NDArray, sr: int, vad: List[VADSegment], args: Args
+) -> tuple[numpy.typing.NDArray, List[tuple[float, float]]]:
+    classifier = EncoderClassifier.from_hparams(
+        source="speechbrain/spkrec-ecapa-voxceleb", run_opts={"device": "cuda"}
+    )
+    assert isinstance(classifier, EncoderClassifier)
+
+    embeddings: list = []
+    windows: List[tuple[float, float]] = []
+    for seg in vad:
+        for start in frange(seg.start, seg.end, args.emb_hop_s):
+            end = min(seg.end, start + args.emb_window_s)
+            if end - start >= args.ecapa_stability_floor:
+                windows.append((start, end))
+                start = max(0, int(start * sr))
+                end = min(len(audio), int(end * sr))
+                clip = audio[start:end].astype(numpy.float32)
+                if clip.size == 0 or numpy.max(numpy.abs(clip)) == 0:
+                    continue
+                with torch.no_grad():
+                    t = torch.from_numpy(clip).float().unsqueeze(0)
+                e = classifier.encode_batch(t)
+                embedding = e.squeeze().cpu().numpy().astype(numpy.float32)
+                embeddings.append(embedding)
+
+    if embeddings:
+        return numpy.stack(embeddings), windows
+
+    with torch.no_grad():
+        null_tensor = torch.zeros(1, INPUT_SAMPLE_RATE_KHZ)
+    null_embedding = classifier.encode_batch(null_tensor)
+    embed_dimension_length = int(null_embedding.squeeze().shape[-1])
+    null_window = numpy.zeros((0, embed_dimension_length), dtype=numpy.float32)
+    return null_window, []
+
+
 if __name__ == "__main__":
+    assert torch.cuda.is_available()
+    assert torch.version.cuda == "12.8"  # type: ignore
+
     args = parse_args()
     wav = preprocess_audio(args.input)
-    vad = voice_activation_detection(wav, args)
-    pprint(vad)
+    audio, sample_rate = soundfile.read(wav)
+    assert sample_rate == INPUT_SAMPLE_RATE_KHZ
+
+    vad = voice_activation_detection(audio, sample_rate, args)
+    embeddings, windows = embed_windows(audio, sample_rate, vad, args)
+    print("=== EMBEDDINGS ===\n")
+    pprint(embeddings)
+    print("=== WINDOWS ===\n")
+    pprint(windows)
